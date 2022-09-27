@@ -1,0 +1,192 @@
+- hosts: apache
+  become: true
+
+  pre_tasks:
+    - name: Get public cert file name
+      shell: |
+        public_certs=$(awk '/SSLCertificateFile/ {print $2}' /etc/apache2/sites-enabled/* | uniq | tail -n1)
+        for public in $public_certs; do
+          #openssl x509 -subject -noout -in $public | grep '*.domain.com' &> /dev/null
+          #cn=$(openssl x509 -subject -noout -in $public | rev | cut -c-18 | rev)
+          cn=$(openssl x509 -subject -noout -in $public | rev | cut -c-9 | rev)
+          if [ "$cn" = '*.domain.com' ]; then
+             echo $public
+          fi
+        done
+      register: apache_public_cert
+
+    - name: debug
+      debug:
+        var: apache_public_cert.stdout
+
+    - name: Find vhost file...
+      shell: |
+        grep -l "{{ apache_public_cert.stdout }}" /etc/apache2/sites-enabled/* | tail -n1
+      register: vhost_file
+
+    - name: debug
+      debug:
+        var: vhost_file.stdout
+
+    - name: Get ServerName
+      shell: |
+        key_cert=$(grep -i "servername" "{{ vhost_file.stdout }}" | sed -e 's/https:\/\///g' -e 's/:443//' -e 's/www.//g'| awk '{print $2}'| uniq | tail -n1)
+        echo $key_cert
+      register: apache_servername
+
+    - name: debug
+      debug:
+        var: apache_servername.stdout
+
+    - name: Logging sites changed...
+      lineinfile:
+        path: "/tmp/log/{{ ansible_hostname }}.log"
+        line: "=== {{ apache_servername.stdout }} ==="
+        create: yes
+      delegate_to: localhost
+      when: apache_servername.stdout is defined or apache_servername.stdout != ""
+
+    - name: Get key cert file name
+      shell: |
+        key_cert=$(awk '/SSLCertificateKeyFile/ {print $2}' "{{ vhost_file.stdout }}")
+        echo $key_cert
+      register: apache_key_cert
+      when: apache_servername.stdout is defined or apache_servername.stdout != ""
+
+    - name: debug
+      debug:
+        var: apache_key_cert.stdout
+
+    - name: Get ca cert file name
+      shell: |
+        ca_cert=$(awk '/SSLCertificateChainFile/ {print $2}' "{{ vhost_file.stdout }}")
+        echo $ca_cert
+      register: apache_ca_cert
+      when: apache_servername.stdout is defined or apache_servername.stdout != ""
+
+    - name: debug
+      debug:
+        var: apache_ca_cert.stdout
+
+    - name: Get a cert from an https port
+      community.crypto.get_certificate:
+        host: "{{ apache_servername.stdout }}"
+        port: 443
+      delegate_to: localhost
+      run_once: true
+      register: cert
+      when: apache_servername.stdout is defined or apache_servername.stdout != ""
+
+    - name: How many days until cert expires
+      set_fact:
+        expire_days_before: "{{ (( cert.not_after | to_datetime('%Y%m%d%H%M%SZ')) - (ansible_date_time.iso8601 | to_datetime('%Y-%m-%dT%H:%M:%SZ')) ).days }}"
+      when: apache_servername.stdout is defined or apache_servername.stdout != ""
+
+    - name: debug
+      debug:
+        var: expire_days_before
+
+    - name: Logging date before...
+      lineinfile:
+        path: "/tmp/log/{{ ansible_hostname }}.log"
+        line: "Antes: {{ expire_days_before }} dias"
+      delegate_to: localhost
+      when: expire_days_before is defined or expire_days_before != ""
+
+    - name: Logging host name...
+      lineinfile:
+        path: "/tmp/log/{{ ansible_hostname }}.log"
+        line: "Server: {{ ansible_hostname }}"
+      delegate_to: localhost
+      when: ansible_hostname is defined or ansible_hostname  != ""
+
+    - name: Logging private file...
+      lineinfile:
+        path: "/tmp/log/{{ ansible_hostname }}.log"
+        line: "Private: {{ apache_key_cert.stdout }}"
+      delegate_to: localhost
+      when: apache_key_cert.stdout is defined or apache_key_cert.stdout != ""
+
+    - name: Logging public file...
+      lineinfile:
+        path: "/tmp/log/{{ ansible_hostname }}.log"
+        line: "Public: {{ apache_public_cert.stdout }}"
+      delegate_to: localhost
+      when: apache_public_cert.stdout is defined or apache_public_cert.stdout != ""
+
+    - name: Logging ca file...
+      lineinfile:
+        path: "/tmp/log/{{ ansible_hostname }}.log"
+        line: "CA: {{ apache_ca_cert.stdout }} dias"
+      delegate_to: localhost
+      when: apache_ca_cert.stdout is defined or apache_ca_cert.stdout != ""
+
+    - name: Backup apache folder
+      copy:
+        src: /etc/apache2
+        dest: /etc/apache2.bckp-ssl
+        remote_src: yes
+
+    - name: Copy public cert to remote
+      copy:
+        src: files/domain.com.cer
+        dest: "{{ apache_public_cert.stdout }}"
+        #dest: "/tmp/"
+        owner: root
+        group: root
+        mode: '0644'
+      when: apache_servername.stdout is defined or apache_servername.stdout != ""
+
+    - name: Copy key cert to remote
+      copy:
+        src: files/domain.com.key
+        dest: "{{ apache_key_cert.stdout }}"
+        #dest: "/tmp/"
+        owner: root
+        group: root
+        mode: '0600'
+      when: apache_servername.stdout is defined or apache_servername.stdout != ""
+
+    - name: Copy ca cert to remote
+      copy:
+        src: files/ca_chain.pem
+        dest: "{{ apache_ca_cert.stdout }}"
+        #dest: "/tmp/"
+        owner: root
+        group: root
+        mode: '0600'
+      notify: Restart Apache2
+      when: apache_servername.stdout is defined or apache_servername.stdout != ""
+
+
+  handlers:
+    - name: Restart Apache2
+      service:
+        name: apache2
+        state: reloaded
+
+  tasks:
+    - name: Get a cert from an https port
+      community.crypto.get_certificate:
+        host: "{{ apache_servername.stdout }}"
+        port: 443
+      delegate_to: localhost
+      run_once: true
+      register: cert
+      when: apache_servername.stdout is defined or apache_servername.stdout != ""
+
+    - name: How many days until cert expires
+      set_fact:
+        expire_days_after: "{{ (( cert.not_after | to_datetime('%Y%m%d%H%M%SZ')) - (ansible_date_time.iso8601 | to_datetime('%Y-%m-%dT%H:%M:%SZ')) ).days }}"
+      when: apache_servername.stdout is defined or apache_servername.stdout != ""
+
+    - name: debug
+      debug:
+        var: expire_days_after
+
+    - name: Logging date after...
+      lineinfile:
+        path: "/tmp/log/{{ ansible_hostname }}.log"
+        line: "Depois: {{ expire_days_after }} dias"
+      delegate_to: localhost
+      when: expire_days_after is defined or expire_days_after != ""
